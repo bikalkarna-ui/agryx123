@@ -1172,74 +1172,206 @@ function PgTasks({ tasks, notes, addTask, toggleTask, delTask, addNote, delNote 
 }
 
 // ─── Career Hub ────────────────────────────────────────────────────
-function PgCareer({ profile, userMeta={}, onLimitReached }) {
+function PgCareer({ profile, userMeta = {}, onLimitReached }) {
   const [tab, setTab] = useState('resume');
   return (
     <div>
-      <div style={{marginBottom:22}}><h1 style={{fontSize:24,fontWeight:800}}>💼 Career Hub</h1><p style={{color:'#888',fontSize:13}}>AI resume, LinkedIn, interview prep & job tracker.</p></div>
-      <Tabs tabs={[{id:'resume',label:'📄 Resume'},{id:'linkedin',label:'🔗 LinkedIn'},{id:'interview',label:'🎤 Interview'},{id:'jobs',label:'💼 Jobs'},{id:'advisor',label:'🤖 Advisor'}]} active={tab} onChange={setTab}/>
-      {tab==='resume'&&<ResumeTab profile={profile}/>}
-      {tab==='linkedin'&&<LinkedInTab profile={profile}/>}
-      {tab==='interview'&&<InterviewTab profile={profile}/>}
-      {tab==='jobs'&&<JobsTab/>}
-      {tab==='advisor'&&<div className="card" style={{height:'calc(100vh - 280px)',display:'flex',flexDirection:'column'}}><ChatBox sys={`You are an expert career advisor for ${profile.name} studying ${profile.major}. Career goal: ${profile.careerGoal||'TBD'}. Give actionable advice.`} welcome={`Hi! I'm your Career Advisor.\n\nStudying **${profile.major}**. I can help with:\n- Career paths & salary\n- Networking strategies\n- Skill development\n- Internship search\n\nWhat's on your mind?`} suggested={['What careers suit my major?','How to negotiate salary?','Best internships to apply for?','How to network as a student?']}/></div>}
+      <div style={{ marginBottom: 22 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 800 }}>💼 Career Hub</h1>
+        <p style={{ color: '#888', fontSize: 13 }}>AI resume, LinkedIn, interview prep & job tracker.</p>
+      </div>
+      <Tabs tabs={[{ id: 'resume', label: '📄 Resume' }, { id: 'linkedin', label: '🔗 LinkedIn' }, { id: 'interview', label: '🎤 Interview' }, { id: 'jobs', label: '💼 Jobs' }, { id: 'advisor', label: '🤖 Advisor' }]} active={tab} onChange={setTab} />
+      {tab === 'resume'    && <ResumeTab    profile={profile} userMeta={userMeta} onLimitReached={onLimitReached} />}
+      {tab === 'linkedin'  && <LinkedInTab  profile={profile} userMeta={userMeta} onLimitReached={onLimitReached} />}
+      {tab === 'interview' && <InterviewTab profile={profile} userMeta={userMeta} onLimitReached={onLimitReached} />}
+      {tab === 'jobs'      && <JobsTab />}
+      {tab === 'advisor'   && (
+        <div className="card" style={{ height: 'calc(100vh - 280px)', display: 'flex', flexDirection: 'column' }}>
+          <ChatBox
+            sys={`Career advisor for ${profile.major} student. Goal: ${profile.careerGoal || 'TBD'}. Give concise, actionable advice.`}
+            welcome={`Hi! I'm your Career Advisor.\n\nStudying **${profile.major}**. Ask me about:\n- Career paths & salary\n- Networking & interviews\n- Internship search\n- Skill development`}
+            suggested={['What careers suit my major?', 'How to negotiate salary?', 'Best internships for students?', 'How to network effectively?']}
+            userMeta={userMeta}
+            onLimitReached={onLimitReached}
+          />
+        </div>
+      )}
     </div>
   );
 }
 
-function ResumeTab({profile}){
-  const [f,setF]=useState({name:profile.name,major:profile.major,uni:profile.university||'',gpa:'',role:'',skills:'',exp:'',achieve:''});
-  const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
-  const set=(k,v)=>setF(x=>({...x,[k]:v}));
-  async function build(){setBusy(true);setOut('');await aiStream([{role:'user',content:`Build a professional ATS-optimized resume:\nName:${f.name}\nMajor:${f.major}\nUniversity:${f.uni}\nGPA:${f.gpa}\nTarget Role:${f.role}\nSkills:${f.skills}\nExperience:${f.exp}\nAchievements:${f.achieve}\n\nSections: Header, Objective, Education, Skills, Experience/Projects, Achievements. Strong action verbs.`}],'You are an expert resume writer.',p=>setOut(p),()=>setBusy(false),userMeta);}
-  return <div style={{display:'grid', gap:16}} className="rg-2">
-    <div className="card">
-      <div style={{fontSize:14,fontWeight:700,marginBottom:14}}>📝 Your Info</div>
-      {[['name','Full Name'],['major','Major'],['uni','University'],['gpa','GPA'],['role','Target Role'],['skills','Skills']].map(([k,l])=><FF key={k} label={l}><input className="ag-input" value={f[k]} onChange={e=>set(k,e.target.value)}/></FF>)}
-      <FF label="Experience & Projects"><textarea className="ag-input" style={{resize:'vertical',minHeight:80}} value={f.exp} onChange={e=>set('exp',e.target.value)} placeholder="Internships, projects..."/></FF>
-      <FF label="Achievements"><textarea className="ag-input" style={{resize:'vertical',minHeight:60}} value={f.achieve} onChange={e=>set('achieve',e.target.value)} placeholder="Awards, clubs..."/></FF>
-      <button className="btn-red btn-full" onClick={build} disabled={busy}>{busy?<><Spin/>Building...</>:'✨ Build Resume'}</button>
-    </div>
-    <div className="card">
-      <div style={{fontSize:14,fontWeight:700,marginBottom:12,display:'flex',alignItems:'center',gap:10}}>📄 AI Resume {out&&<><button onClick={()=>window.print()} style={{padding:'5px 12px',border:'1px solid #ebebeb',borderRadius:7,cursor:'pointer',fontSize:11,background:'none',fontFamily:'inherit'}}>🖨️ Print</button><button onClick={()=>navigator.clipboard.writeText(out)} style={{padding:'5px 12px',border:'1px solid #ebebeb',borderRadius:7,cursor:'pointer',fontSize:11,background:'none',fontFamily:'inherit'}}>📋 Copy</button></>}</div>
-      {out?<AIOut text={out}/>:<Empty icon="📄" text="Fill in your info to generate a professional resume"/>}
-    </div>
-  </div>;
+// Streaming output component — shows plain text while generating, switches to markdown when done
+// This avoids running 6 regex operations on every single token
+function StreamOut({ text, done }) {
+  if (!text) return null;
+  if (!done) {
+    // Plain display during streaming — zero processing cost
+    return <div style={{ fontSize: 13, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{text}</div>;
+  }
+  // Only parse markdown once, when complete
+  return <AIOut text={text} />;
 }
 
-function LinkedInTab({profile}){
-  const [role,setRole]=useState('');const [ind,setInd]=useState('');const [uniq,setUniq]=useState('');const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
-  async function gen(){setBusy(true);setOut('');await aiStream([{role:'user',content:`LinkedIn profile:\nName:${profile.name}\nMajor:${profile.major}\nTarget Role:${role}\nIndustry:${ind}\nUnique:${uniq}\n\nGenerate: Headline (120 chars), About (2000 chars), Top 20 Skills, Profile tips.`}],'You are a LinkedIn expert.',p=>setOut(p),()=>setBusy(false),userMeta);}
-  return <div style={{display:'grid', gap:16}} className="rg-2">
-    <div className="card">
-      <FF label="Target Role"><input className="ag-input" value={role} onChange={e=>setRole(e.target.value)} placeholder="Software Engineer"/></FF>
-      <FF label="Industry"><input className="ag-input" value={ind} onChange={e=>setInd(e.target.value)} placeholder="Technology"/></FF>
-      <FF label="What Makes You Unique?"><textarea className="ag-input" style={{resize:'vertical',minHeight:100}} value={uniq} onChange={e=>setUniq(e.target.value)} placeholder="Your passions, unique experiences..."/></FF>
-      <button className="btn-red btn-full" onClick={gen} disabled={busy}>{busy?<><Spin/>Generating...</>:'🔗 Generate LinkedIn Profile'}</button>
+function ResumeTab({ profile, userMeta = {}, onLimitReached }) {
+  const [f, setF]   = useState({ name: profile.name, major: profile.major, uni: profile.university || '', gpa: '', role: '', skills: '', exp: '', achieve: '' });
+  const [out, setOut]   = useState('');
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const set = (k, v) => setF(x => ({ ...x, [k]: v }));
+
+  async function build() {
+    setBusy(true); setOut(''); setDone(false);
+    await aiStream(
+      [{ role: 'user', content: `Write a resume for:\nName: ${f.name} | Major: ${f.major} | University: ${f.uni} | GPA: ${f.gpa} | Target: ${f.role}\nSkills: ${f.skills}\nExperience: ${f.exp}\nAchievements: ${f.achieve}\n\nFormat: Header, Objective (2 lines), Education, Skills (bullet list), Experience (3 bullets each with metrics), Achievements. Use strong action verbs. Keep it to 1 page.` }],
+      'Expert resume writer. Write concise, ATS-optimized resumes. No fluff.',
+      p => { setOut(p); setDone(false); },
+      full => {
+        if (full === 'LIMIT_REACHED') { onLimitReached?.(); }
+        else { setOut(full); setDone(true); }
+        setBusy(false);
+      },
+      userMeta, false, 800  // Haiku + 800 tokens — enough for a 1-page resume, fast
+    );
+  }
+
+  return (
+    <div style={{ display: 'grid', gap: 16 }} className="rg-2">
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>📝 Your Info</div>
+        {[['name', 'Full Name'], ['major', 'Major'], ['uni', 'University'], ['gpa', 'GPA'], ['role', 'Target Role'], ['skills', 'Skills (comma separated)']].map(([k, l]) => (
+          <FF key={k} label={l}><input className="ag-input" value={f[k]} onChange={e => set(k, e.target.value)} /></FF>
+        ))}
+        <FF label="Experience & Projects"><textarea className="ag-input" style={{ resize: 'vertical', minHeight: 80 }} value={f.exp} onChange={e => set('exp', e.target.value)} placeholder="Internships, projects, roles..." /></FF>
+        <FF label="Achievements"><textarea className="ag-input" style={{ resize: 'vertical', minHeight: 60 }} value={f.achieve} onChange={e => set('achieve', e.target.value)} placeholder="Awards, clubs, leadership..." /></FF>
+        <button className="btn-red btn-full" onClick={build} disabled={busy}>{busy ? <><Spin /> Building...</> : '✨ Build Resume'}</button>
+      </div>
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+          📄 AI Resume
+          {out && <>
+            <button onClick={() => window.print()} style={{ padding: '5px 12px', border: '1px solid #ebebeb', borderRadius: 7, cursor: 'pointer', fontSize: 11, background: 'none', fontFamily: 'inherit' }}>🖨️ Print</button>
+            <button onClick={() => navigator.clipboard.writeText(out)} style={{ padding: '5px 12px', border: '1px solid #ebebeb', borderRadius: 7, cursor: 'pointer', fontSize: 11, background: 'none', fontFamily: 'inherit' }}>📋 Copy</button>
+          </>}
+        </div>
+        {busy && !out && <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#888', fontSize: 13 }}><Spin dark /> Writing your resume...</div>}
+        {out ? <StreamOut text={out} done={done} /> : !busy && <Empty icon="📄" text="Fill in your info to generate a professional resume" />}
+      </div>
     </div>
-    <div className="card">{out?<AIOut text={out}/>:<Empty icon="🔗" text="Generate your optimised LinkedIn profile"/>}</div>
-  </div>;
+  );
 }
 
-function InterviewTab({profile}){
-  const [role,setRole]=useState('');const [type,setType]=useState('behavioral');const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
-  const [q,setQ]=useState('');const [ans,setAns]=useState('');const [fb,setFb]=useState('');const [fl,setFl]=useState(false);
-  async function gen(){setBusy(true);setOut('');await aiStream([{role:'user',content:`10 ${type} interview questions for ${role||profile.major+' student'}. For each: question, what interviewer looks for, answer tip.`}],'You are an expert interview coach.',p=>setOut(p),()=>setBusy(false),userMeta);}
-  async function getFb(){if(!ans.trim())return;setFl(true);setFb('');await aiStream([{role:'user',content:`Question:"${q}"\nAnswer:"${ans}"\nFeedback: strengths, weaknesses, improved answer, score/10.`}],'You are an expert interview coach.',p=>setFb(p),()=>setFl(false),userMeta);}
-  return <div style={{display:'grid', gap:16}} className="rg-2">
-    <div className="card">
-      <FF label="Role"><input className="ag-input" value={role} onChange={e=>setRole(e.target.value)} placeholder="Software Engineer Intern"/></FF>
-      <FF label="Type"><select className="ag-input" value={type} onChange={e=>setType(e.target.value)}><option value="behavioral">Behavioral</option><option value="technical">Technical</option><option value="general">General HR</option><option value="case">Case Study</option></select></FF>
-      <button className="btn-red btn-full" style={{ marginBottom:16 }} onClick={gen} disabled={busy}>{busy?<><Spin/>Generating...</>:'🎤 Generate Questions'}</button>
-      {out&&<AIOut text={out}/>}
+function LinkedInTab({ profile, userMeta = {}, onLimitReached }) {
+  const [role, setRole] = useState('');
+  const [ind, setInd]   = useState('');
+  const [uniq, setUniq] = useState('');
+  const [out, setOut]   = useState('');
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function gen() {
+    setBusy(true); setOut(''); setDone(false);
+    await aiStream(
+      [{ role: 'user', content: `Write LinkedIn profile sections for:\nName: ${profile.name} | Major: ${profile.major} | Target: ${role} | Industry: ${ind}\nWhat makes them unique: ${uniq}\n\nWrite:\n1. Headline (under 120 chars, keyword-rich)\n2. About section (3 short paragraphs, first person, 150-200 words total)\n3. Top 10 skills to add\n4. One tip for their profile photo/banner` }],
+      'LinkedIn profile expert. Be specific and punchy. No generic phrases.',
+      p => { setOut(p); setDone(false); },
+      full => {
+        if (full === 'LIMIT_REACHED') { onLimitReached?.(); }
+        else { setOut(full); setDone(true); }
+        setBusy(false);
+      },
+      userMeta, false, 700  // 700 tokens — enough for all sections, no overrun
+    );
+  }
+
+  return (
+    <div style={{ display: 'grid', gap: 16 }} className="rg-2">
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>🔗 Generate LinkedIn Profile</div>
+        <FF label="Target Role"><input className="ag-input" value={role} onChange={e => setRole(e.target.value)} placeholder="Software Engineer" /></FF>
+        <FF label="Industry"><input className="ag-input" value={ind} onChange={e => setInd(e.target.value)} placeholder="Technology, Finance..." /></FF>
+        <FF label="What Makes You Unique?"><textarea className="ag-input" style={{ resize: 'vertical', minHeight: 90 }} value={uniq} onChange={e => setUniq(e.target.value)} placeholder="Your passions, unique projects, values..." /></FF>
+        <button className="btn-red btn-full" onClick={gen} disabled={busy}>{busy ? <><Spin /> Generating...</> : '🔗 Generate LinkedIn Profile'}</button>
+      </div>
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>✍️ Your LinkedIn Profile</div>
+        {busy && !out && <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#888', fontSize: 13 }}><Spin dark /> Writing your profile...</div>}
+        {out ? <StreamOut text={out} done={done} /> : !busy && <Empty icon="🔗" text="Fill in your details to generate your LinkedIn profile" />}
+      </div>
     </div>
-    <div className="card">
-      <FF label="Question to Practice"><input className="ag-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Paste a question here..."/></FF>
-      <FF label="Your Answer"><textarea className="ag-input" style={{resize:'vertical',minHeight:120}} value={ans} onChange={e=>setAns(e.target.value)} placeholder="Type your answer..."/></FF>
-      <button className="btn-red btn-full" onClick={getFb} disabled={fl}>{fl?<><Spin/>Analysing...</>:'✨ Get AI Feedback'}</button>
-      {fb&&<div style={{marginTop:14}}><AIOut text={fb}/></div>}
+  );
+}
+
+function InterviewTab({ profile, userMeta = {}, onLimitReached }) {
+  const [role, setRole] = useState('');
+  const [type, setType] = useState('behavioral');
+  const [out, setOut]   = useState('');
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [q, setQ]       = useState('');
+  const [ans, setAns]   = useState('');
+  const [fb, setFb]     = useState('');
+  const [fbDone, setFbDone] = useState(false);
+  const [fl, setFl]     = useState(false);
+
+  async function gen() {
+    setBusy(true); setOut(''); setDone(false);
+    await aiStream(
+      [{ role: 'user', content: `Give 5 ${type} interview questions for a ${role || profile.major + ' student'}.\nFor each: question + what the interviewer wants to hear (1 line) + STAR tip (1 line).` }],
+      'Expert interview coach. Be direct and practical.',
+      p => { setOut(p); setDone(false); },
+      full => {
+        if (full === 'LIMIT_REACHED') { onLimitReached?.(); }
+        else { setOut(full); setDone(true); }
+        setBusy(false);
+      },
+      userMeta, false, 600  // 5 questions fits in 600 tokens easily
+    );
+  }
+
+  async function getFb() {
+    if (!ans.trim()) return;
+    setFl(true); setFb(''); setFbDone(false);
+    await aiStream(
+      [{ role: 'user', content: `Interview Q: "${q}"\nCandidate answer: "${ans}"\n\nGive: score /10, what worked, what to improve, a better version in 3 sentences.` }],
+      'Interview coach. Give specific, fast feedback.',
+      p => { setFb(p); setFbDone(false); },
+      full => {
+        if (full === 'LIMIT_REACHED') { onLimitReached?.(); }
+        else { setFb(full); setFbDone(true); }
+        setFl(false);
+      },
+      userMeta, false, 400  // feedback is short — 400 tokens, very fast
+    );
+  }
+
+  return (
+    <div style={{ display: 'grid', gap: 16 }} className="rg-2">
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>🎤 Mock Interview</div>
+        <FF label="Role"><input className="ag-input" value={role} onChange={e => setRole(e.target.value)} placeholder="Software Engineer Intern" /></FF>
+        <FF label="Interview Type">
+          <select className="ag-input" value={type} onChange={e => setType(e.target.value)}>
+            <option value="behavioral">Behavioral (STAR)</option>
+            <option value="technical">Technical</option>
+            <option value="general">General HR</option>
+            <option value="case">Case Study</option>
+          </select>
+        </FF>
+        <button className="btn-red btn-full" style={{ marginBottom: 14 }} onClick={gen} disabled={busy}>{busy ? <><Spin /> Generating...</> : '🎤 Generate 5 Questions'}</button>
+        {busy && !out && <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#888', fontSize: 13 }}><Spin dark /> Preparing questions...</div>}
+        {out && <StreamOut text={out} done={done} />}
+      </div>
+      <div className="card">
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>💬 Practice & Feedback</div>
+        <FF label="Paste a Question"><input className="ag-input" value={q} onChange={e => setQ(e.target.value)} placeholder="Paste any interview question here..." /></FF>
+        {q && <div style={{ background: '#fff5f5', border: '1px solid #ffd0d0', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#e02020' }}>❓ {q}</div>}
+        <FF label="Your Answer"><textarea className="ag-input" style={{ resize: 'vertical', minHeight: 110 }} value={ans} onChange={e => setAns(e.target.value)} placeholder="Type your answer using STAR: Situation, Task, Action, Result..." /></FF>
+        <button className="btn-red btn-full" onClick={getFb} disabled={fl || !q || !ans.trim()}>{fl ? <><Spin /> Analysing...</> : '✨ Get AI Feedback'}</button>
+        {fl && !fb && <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#888', fontSize: 13, marginTop: 12 }}><Spin dark /> Analysing your answer...</div>}
+        {fb && <div style={{ marginTop: 14 }}><StreamOut text={fb} done={fbDone} /></div>}
+      </div>
     </div>
-  </div>;
+  );
 }
 
 function JobsTab(){
