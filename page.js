@@ -25,7 +25,7 @@ async function aiCall(messages, system, userMeta = {}, useSmart = false) {
       body: JSON.stringify({
         model:      useSmart ? MODEL_SMART : MODEL_FAST,
         max_tokens: 1200,
-        stream:     false,
+        stream:     false,   // route handles this: reads SSE and returns full JSON
         system:     system || 'You are a helpful AI assistant for students.',
         messages,
         ...userMeta,
@@ -48,9 +48,10 @@ async function aiCall(messages, system, userMeta = {}, useSmart = false) {
   }
 }
 
-// ── aiStream: REAL SSE streaming — words appear instantly ────────────
-// onChunk(partialText) called as each word arrives
-// onDone(fullText)    called when stream completes
+// ── aiStream: true SSE streaming with throttled React updates ────────
+// Batches tokens every 30ms so React doesn't re-render on every word.
+// onChunk(partialText) — called ~30ms intervals while streaming
+// onDone(fullText)     — called when complete
 async function aiStream(messages, system, onChunk, onDone, userMeta = {}, useSmart = false) {
   try {
     const r = await fetch('/api/ai', {
@@ -66,7 +67,6 @@ async function aiStream(messages, system, onChunk, onDone, userMeta = {}, useSma
       }),
     });
 
-    // Handle limit / error before reading stream
     if (r.status === 403) {
       const d = await r.json();
       if (d.error?.message === 'LIMIT_REACHED') { onDone?.('LIMIT_REACHED'); return; }
@@ -82,35 +82,46 @@ async function aiStream(messages, system, onChunk, onDone, userMeta = {}, useSma
     let full = '';
     let buf  = '';
 
+    // Throttle: only call onChunk every 30ms to batch React renders
+    // This makes the UI feel smooth instead of stuttering on each word
+    let pending   = '';
+    let scheduled = false;
+    function flush() {
+      if (pending) { full += pending; pending = ''; onChunk?.(full); }
+      scheduled = false;
+    }
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
-      buf = lines.pop(); // keep incomplete line in buffer
+      buf = lines.pop();
 
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
         const raw = line.slice(5).trim();
-        if (raw === '[DONE]') continue;
+        if (!raw || raw === '[DONE]') continue;
         try {
           const evt = JSON.parse(raw);
-          // Anthropic SSE delta format
           if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
-            full += evt.delta.text;
-            onChunk?.(full);
+            pending += evt.delta.text;
+            if (!scheduled) {
+              scheduled = true;
+              setTimeout(flush, 30);   // batch into 30ms chunks — ~33 renders/sec max
+            }
           }
-          // Handle error events from Anthropic
           if (evt.type === 'error') {
-            onChunk?.(evt.error?.message || 'Error');
-            onDone?.(evt.error?.message || 'Error');
-            return;
+            const msg = evt.error?.message || 'Stream error';
+            onChunk?.(msg); onDone?.(msg); return;
           }
-        } catch (_) { /* partial JSON line — ignore */ }
+        } catch (_) {}
       }
     }
 
+    // Flush any remaining buffered text
+    if (pending) { full += pending; pending = ''; onChunk?.(full); }
     onDone?.(full || 'No response.');
   } catch (e) {
     const msg = `Connection error: ${e.message}`;
