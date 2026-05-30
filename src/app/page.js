@@ -1,18 +1,96 @@
 'use client';
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import './globals.css';
 
-// ─── Supabase client ───────────────────────────────────────────────
-// Supabase — lazy init, safe at build time
-const SUPA_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
+// ─── Supabase ──────────────────────────────────────────────────────
+const SUPA_URL = process.env.NEXT_PUBLIC_SUPABASE_URL  || 'https://placeholder.supabase.co';
 const SUPA_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'placeholder-key';
-const sb = createClient(SUPA_URL, SUPA_KEY);
+const sb       = createClient(SUPA_URL, SUPA_KEY);
 const SB_READY = !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
 
-// ─── Anthropic via our proxy ─
-const MODEL = 'claude-sonnet-4-5';
-// ─── Service Worker + Push Notifications ─────────────────────────
+const MODEL_FAST  = 'claude-haiku-4-5';   // ~800ms first token
+const MODEL_SMART = 'claude-sonnet-4-5';  // used only for study planner
+
+// ── aiCall: non-streaming, only for JSON (syllabus parse) ─────────────────
+async function aiCall(messages, system, userMeta = {}, tokens = 800) {
+  try {
+    const r = await fetch('/api/ai', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_FAST, max_tokens: tokens, stream: false,
+        system: system || 'You are a helpful AI assistant for students.',
+        messages, ...userMeta,
+      }),
+    });
+    if (r.status === 403) {
+      const d = await r.json().catch(() => ({}));
+      if (d.error?.message === 'LIMIT_REACHED') return { limitReached: true };
+    }
+    if (!r.ok) return { error: `Error ${r.status}` };
+    const d = await r.json();
+    if (d.error?.message === 'LIMIT_REACHED') return { limitReached: true };
+    if (d.error) return { error: d.error.message };
+    return { text: d.content?.[0]?.text || '' };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ── aiStream: true SSE — tokens visible instantly, 40ms batched updates ────
+async function aiStream(messages, system, onChunk, onDone, userMeta = {}, smart = false, tokens = 600) {
+  try {
+    const r = await fetch('/api/ai', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: smart ? MODEL_SMART : MODEL_FAST,
+        max_tokens: tokens, stream: true,
+        system: system || 'You are a helpful AI assistant for students.',
+        messages, ...userMeta,
+      }),
+    });
+    if (r.status === 403) {
+      const d = await r.json().catch(() => ({}));
+      if (d.error?.message === 'LIMIT_REACHED') { onDone('LIMIT_REACHED'); return; }
+    }
+    if (!r.ok) { const t = await r.text().catch(() => ''); onDone(`Error ${r.status}: ${t.slice(0, 80)}`); return; }
+
+    const reader = r.body.getReader(), decoder = new TextDecoder();
+    let full = '', buf = '', pending = '', timer = null;
+
+    const flush = () => {
+      if (!pending) return;
+      full += pending; pending = ''; timer = null;
+      onChunk(full);
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === '[DONE]') continue;
+        try {
+          const evt = JSON.parse(raw);
+          if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+            pending += evt.delta.text;
+            if (!timer) timer = setTimeout(flush, 40);
+          }
+          if (evt.type === 'error') { onDone(evt.error?.message || 'Stream error'); return; }
+        } catch (_) {}
+      }
+    }
+    if (timer) clearTimeout(timer);
+    if (pending) full += pending;
+    onDone(full || 'No response.');
+  } catch (e) { onDone(`Connection error: ${e.message}`); }
+}
+
+// ─── Service Worker
 function registerSW() {
   if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
   navigator.serviceWorker.register('/sw.js').then(reg => {
@@ -55,41 +133,7 @@ function scheduleDeadlineNotifications(deadlines) {
 const FREE_LIMIT = 1000;
 const ADMIN_EMAIL = 'bikalkarna@gmail.com';
 
-async function aiCall(messages, system, userMeta = {}) {
-  try {
-    const r = await fetch('/api/ai', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1500,
-        stream: false,
-        system: system || 'You are a helpful AI assistant for students.',
-        messages,
-        ...userMeta,
-      }),
-    });
-    if (!r.ok) {
-      const txt = await r.text();
-      return { error: `Error ${r.status}: ${txt.slice(0, 200)}` };
-    }
-    const d = await r.json();
-    if (d.error?.message === 'LIMIT_REACHED') return { limitReached: true };
-    if (d.error) return { error: d.error.message };
-    return { text: d.content?.[0]?.text || 'No response.' };
-  } catch (e) {
-    return { error: e.message };
-  }
-}
-
-async function aiStream(messages, system, onChunk, onDone, userMeta = {}) {
-  onChunk?.('...');
-  const result = await aiCall(messages, system, userMeta);
-  if (result.limitReached) { onDone?.('LIMIT_REACHED'); return; }
-  if (result.error) { onChunk?.(result.error); onDone?.(result.error); return; }
-  onChunk?.(result.text);
-  onDone?.(result.text);
-}
+// aiCall and aiStream defined above with real streaming
 
 // ─── Styles ────────────────────────────────────────────────────────
 const S = {
@@ -371,9 +415,12 @@ function DemoChat({ onStart }) {
     setInp('');
     setMsgs(m => [...m, { r: 'user', t }, { r: 'ai', t: '' }]);
     setBusy(true);
-    const result = await aiCall([{ role: 'user', content: t }], 'You are AGRYX, a helpful AI assistant for students. Give clear, helpful, well-structured answers. Use markdown for formatting.');
-    setMsgs(m => { const u = [...m]; u[u.length - 1] = { r: 'ai', t: result.text || 'Sign up for full access!' }; return u; });
-    setBusy(false);
+    await aiStream(
+      [{ role: 'user', content: t }],
+      'You are AGRYX, a helpful AI assistant for students. Be concise and clear. Use markdown.',
+      partial => setMsgs(m => { const u = [...m]; u[u.length - 1] = { r: 'ai', t: partial }; return u; }),
+      () => setBusy(false)
+    );
   }
 
   return (
@@ -656,19 +703,23 @@ function App({ session, onSignOut }) {
   const [deadlines, setDeadlines] = useState([]);
   const [tasks, setTasks]     = useState([]);
   const [notes, setNotes]     = useState([]);
-  const uid = session.user.id;
-  const isAdmin = session.user.email === ADMIN_EMAIL;
-  const isPaid = isAdmin || profile.plan === 'pro' || profile.plan === 'premium';
+  const uid      = session.user.id;
+  const isAdmin  = session.user.email === ADMIN_EMAIL;
+  const isPaid   = isAdmin || profile.plan === 'pro' || profile.plan === 'premium';
+
+  // Built once — stable reference passed to all AI calls
+  const userMeta = useMemo(() => ({ userId: uid, userEmail: session.user.email }), [uid]);
 
   useEffect(() => { if (sb) load(); }, []);
 
   async function load() {
     if (!SB_READY) return;
+    // All 4 queries fire simultaneously — not sequentially
     const [p, d, t, n] = await Promise.all([
-      sb.from('profiles').select('*').eq('id', uid).single(),
-      sb.from('deadlines').select('*').eq('user_id', uid).order('date'),
-      sb.from('tasks').select('*').eq('user_id', uid),
-      sb.from('notes').select('*').eq('user_id', uid).order('created_at', { ascending: false }),
+      sb.from('profiles').select('name,major,university,year,status,career_goal,courses,plan,chat_count').eq('id', uid).single(),
+      sb.from('deadlines').select('id,title,type,date,priority,points').eq('user_id', uid).order('date').limit(50),
+      sb.from('tasks').select('id,title,priority,due,done').eq('user_id', uid).limit(100),
+      sb.from('notes').select('id,title,content,created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(50),
     ]);
     if (p.data) setProfile(prev => ({ ...prev, name: p.data.name || prev.name, major: p.data.major || prev.major, university: p.data.university || '', year: p.data.year || 'Freshman', status: p.data.status || 'Domestic Student', careerGoal: p.data.career_goal || '', courses: p.data.courses || [], plan: p.data.plan || 'free', chatCount: p.data.chat_count || 0 }));
     if (d.data) {
@@ -679,7 +730,6 @@ function App({ session, onSignOut }) {
     }
     if (t.data) setTasks(t.data);
     if (n.data) setNotes(n.data);
-    // Ask for notification permission after 5 seconds
     if ('Notification' in window && Notification.permission === 'default') {
       setTimeout(() => setNotifPrompt(true), 5000);
     }
@@ -691,9 +741,15 @@ function App({ session, onSignOut }) {
   }
 
   async function addDeadline(d)   { const item = { ...d, id: `d${Date.now()}`, user_id: uid }; setDeadlines(prev => [...prev, item].sort((a,b) => new Date(a.date)-new Date(b.date))); await sb.from('deadlines').insert(item); }
+  // Batch insert — used by syllabus AI to avoid sequential loop
+  async function addDeadlines(items) {
+    const rows = items.map(d => ({ ...d, user_id: uid }));
+    setDeadlines(prev => [...prev, ...rows].sort((a,b) => new Date(a.date)-new Date(b.date)));
+    await sb.from('deadlines').upsert(rows);
+  }
   async function delDeadline(id)  { setDeadlines(prev => prev.filter(d => d.id !== id)); await sb.from('deadlines').delete().eq('id', id); }
   async function addTask(t)       { const item = { ...t, id: `t${Date.now()}`, user_id: uid, done: false }; setTasks(prev => [...prev, item]); await sb.from('tasks').insert(item); }
-  async function toggleTask(id)   { setTasks(prev => prev.map(t => t.id === id ? { ...t, done: !t.done } : t)); const task = tasks.find(t => t.id === id); await sb.from('tasks').update({ done: !task.done }).eq('id', id); }
+  async function toggleTask(id)   { const task = tasks.find(t => t.id === id); setTasks(prev => prev.map(t => t.id === id ? { ...t, done: !t.done } : t)); await sb.from('tasks').update({ done: !task?.done }).eq('id', id); }
   async function delTask(id)      { setTasks(prev => prev.filter(t => t.id !== id)); await sb.from('tasks').delete().eq('id', id); }
   async function addNote(n)       { const item = { ...n, id: `n${Date.now()}`, user_id: uid, created_at: new Date().toISOString() }; setNotes(prev => [item, ...prev]); await sb.from('notes').insert(item); }
   async function delNote(id)      { setNotes(prev => prev.filter(n => n.id !== id)); await sb.from('notes').delete().eq('id', id); }
@@ -704,7 +760,8 @@ function App({ session, onSignOut }) {
     ['tasks','✅','Tasks & Notes'],['career','💼','Career Hub'],['international','🌐','International Hub'],
     ['resources','📚','Resources'],['assistant','🤖','AI Assistant'],['settings','⚙️','Settings'],
   ];
-  const props = { profile, deadlines, tasks, notes, addDeadline, delDeadline, addTask, toggleTask, delTask, addNote, delNote, saveProfile, setPage, uid };
+  // userMeta and onLimitReached passed to ALL page components — previously missing
+  const props = { profile, deadlines, tasks, notes, addDeadline, addDeadlines, delDeadline, addTask, toggleTask, delTask, addNote, delNote, saveProfile, setPage, uid, userMeta, onLimitReached: () => setShowUpgrade(true) };
 
   function nav(p) { setPage(p); setOpen(false); }
 
@@ -917,7 +974,7 @@ function PgDash({ profile, deadlines, tasks, notes, setPage }) {
 }
 
 // ─── Syllabus ──────────────────────────────────────────────────────
-function PgSyllabus({ deadlines, addDeadline, delDeadline, userMeta={}, onLimitReached }) {
+function PgSyllabus({ deadlines, addDeadline, addDeadlines, delDeadline, userMeta = {}, onLimitReached }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [course, setCourse] = useState(null);
@@ -931,9 +988,9 @@ function PgSyllabus({ deadlines, addDeadline, delDeadline, userMeta={}, onLimitR
     if (!text.trim()) { alert('Paste or upload syllabus text first.'); return; }
     setBusy(true); setMsg('');
     const res = await aiCall(
-      [{ role:'user', content:`Return ONLY valid JSON (no markdown, no extra text):\n{"course":{"name":"","code":"","credits":"","semester":""},"professor":{"name":"","email":"","office":"","officeHours":""},"assignments":[{"title":"","type":"Assignment|Quiz|Exam|Midterm|Final|Project","date":"YYYY-MM-DD","priority":"High|Medium|Low","points":""}]}\n\nSyllabus:\n${text.slice(0,6000)}` }],
-      'You are a syllabus parser. Return ONLY valid JSON.',
-      userMeta
+      [{ role:'user', content:`Parse this syllabus. Return ONLY valid JSON:\n{"course":{"name":"","code":"","credits":"","semester":""},"professor":{"name":"","email":"","office":"","officeHours":""},"assignments":[{"title":"","type":"Assignment|Quiz|Exam|Midterm|Final|Project","date":"YYYY-MM-DD","priority":"High|Medium|Low","points":""}]}\n\nSyllabus:\n${text.slice(0,4000)}` }],
+      'Return only valid JSON. No markdown. No explanation.',
+      userMeta, 800
     );
     setBusy(false);
     if (res.limitReached) { onLimitReached?.(); return; }
@@ -941,8 +998,9 @@ function PgSyllabus({ deadlines, addDeadline, delDeadline, userMeta={}, onLimitR
     try {
       const data = JSON.parse((res.text||'').replace(/```json\n?/g,'').replace(/```/g,'').trim());
       setCourse(data.course); setProf(data.professor);
+      // Batch upsert — not a sequential for-loop
       const items = (data.assignments||[]).map((a,i) => ({ id:`s${Date.now()}${i}`, title:a.title||'Assignment', type:a.type||'Assignment', date:a.date||'TBD', priority:a.priority||'Medium', points:a.points||'' }));
-      for (const item of items) await addDeadline(item);
+      await addDeadlines(items);
       setMsg(`✅ ${items.length} assignments extracted and added to your dashboard!`);
     } catch { setMsg('⚠️ Could not parse. Try pasting cleaner syllabus text.'); }
   }
@@ -1009,12 +1067,12 @@ function PgPlanner({ profile, deadlines, userMeta={}, onLimitReached }) {
   async function gen(custom) {
     const d = custom||desc; if(!d.trim()) return;
     setBusy(true); setOut('');
-    const dlCtx = deadlines.length ? `Deadlines: ${deadlines.map(x=>`"${x.title}" due ${x.date}`).join(', ')}` : '';
+    const dlCtx = deadlines.length ? `Deadlines: ${deadlines.slice(0,6).map(x=>`${x.title} (${x.date})`).join(', ')}` : '';
     await aiStream(
-      [{role:'user',content:`Make a detailed weekly study plan.\nStudent: ${profile.name}, ${profile.major}, ${profile.year}.\n${dlCtx}\nSituation: ${d}\n\nDay-by-day schedule for 7 days. Include table (Day|Time|Task|Duration|Strategy), daily goals, breaks, study techniques, self-care.`}],
-      'You are an expert study coach. Create personalised, realistic study plans.',
+      [{role:'user',content:`Study plan for ${profile.major} student. ${dlCtx}\nSituation: ${d}\nCreate 7-day schedule: table (Day|Time|Task|Duration), goals, tips.`}],
+      'You are a study coach. Create practical study plans with tables.',
       p=>setOut(p), ()=>setBusy(false),
-      userMeta
+      userMeta, true, 1000  // Sonnet + more tokens for scheduling
     );
   }
 
@@ -1224,15 +1282,15 @@ function PgIntl({ profile, userMeta={}, onLimitReached }){
   return <div>
     <div style={{marginBottom:22}}><h1 style={{fontSize:24,fontWeight:800}}>🌐 International Hub</h1><p style={{color:'#888',fontSize:13}}>Visa help, CPT/OPT, IELTS grading, embassy prep & scholarships — AI-powered.</p></div>
     <Tabs tabs={[{id:'visa',label:'🛂 Visa'},{id:'cptopt',label:'💼 CPT/OPT'},{id:'ielts',label:'📝 IELTS'},{id:'embassy',label:'🏛️ Embassy'},{id:'scholar',label:'🎓 Scholarships'}]} active={tab} onChange={setTab}/>
-    {tab==='visa'&&<div className="card" style={{height:'calc(100vh - 280px)',display:'flex',flexDirection:'column'}}><div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10,padding:'12px 16px',fontSize:13,color:'#1e40af',marginBottom:12}}>⚠️ General guidance only. Always consult your DSO for official decisions.</div><ChatBox sys={sys} welcome="👋 Visa & Immigration Assistant.\n\nAsk about F-1/J-1 visas, SEVIS, travel rules, maintaining student status." suggested={['How to maintain F-1 status?','Can I work off-campus on F-1?','What is SEVIS?','Travel on F-1 visa rules?']}/></div>}
-    {tab==='cptopt'&&<div className="card" style={{height:'calc(100vh - 280px)',display:'flex',flexDirection:'column'}}><div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10,padding:'12px 16px',fontSize:13,color:'#1e40af',marginBottom:12}}>💼 Always verify CPT/OPT details with your DSO before applying.</div><ChatBox sys={sys} welcome="💼 CPT/OPT Specialist.\n\nAsk about CPT, OPT, STEM extension, work authorisation rules." suggested={['Am I eligible for CPT?','How to apply for OPT?','What is STEM OPT extension?','Can I work while OPT pending?']}/></div>}
-    {tab==='ielts'&&<IELTSTab/>}
-    {tab==='embassy'&&<EmbassyTab/>}
-    {tab==='scholar'&&<ScholarTab profile={profile}/>}
+    {tab==='visa'&&<div className="card" style={{height:'calc(100vh - 280px)',display:'flex',flexDirection:'column'}}><div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10,padding:'12px 16px',fontSize:13,color:'#1e40af',marginBottom:12}}>⚠️ General guidance only. Always consult your DSO for official decisions.</div><ChatBox sys={sys} welcome="👋 Visa & Immigration Assistant.\n\nAsk about F-1/J-1 visas, SEVIS, travel rules, maintaining student status." suggested={['How to maintain F-1 status?','Can I work off-campus on F-1?','What is SEVIS?','Travel on F-1 visa rules?']} userMeta={userMeta} onLimitReached={onLimitReached}/></div>}
+    {tab==='cptopt'&&<div className="card" style={{height:'calc(100vh - 280px)',display:'flex',flexDirection:'column'}}><div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10,padding:'12px 16px',fontSize:13,color:'#1e40af',marginBottom:12}}>💼 Always verify CPT/OPT details with your DSO before applying.</div><ChatBox sys={sys} welcome="💼 CPT/OPT Specialist.\n\nAsk about CPT, OPT, STEM extension, work authorisation rules." suggested={['Am I eligible for CPT?','How to apply for OPT?','What is STEM OPT extension?','Can I work while OPT pending?']} userMeta={userMeta} onLimitReached={onLimitReached}/></div>}
+    {tab==='ielts'&&<IELTSTab userMeta={userMeta}/>}
+    {tab==='embassy'&&<EmbassyTab userMeta={userMeta}/>}
+    {tab==='scholar'&&<ScholarTab profile={profile} userMeta={userMeta}/>}
   </div>;
 }
 
-function IELTSTab(){
+function IELTSTab({ userMeta={} }){
   const [prompt,setPrompt]=useState('');const [essay,setEssay]=useState('');const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
   const prompts=['Some people think longer prison sentences reduce crime. Others believe there are better alternatives. Discuss both views.','In many countries, animals and plants are declining. Why? How can this be addressed?','Some argue an enjoyable job is more important than a high salary. Do you agree?'];
   async function grade(){if(!essay.trim())return;setBusy(true);setOut('');await aiStream([{role:'user',content:`Grade this IELTS Task 2 essay (0-9 scale).\nPrompt:${prompt||'General IELTS essay'}\nEssay(${essay.split(' ').filter(Boolean).length} words):\n${essay}\n\nScore all 4 criteria. Overall band. Specific feedback and improvements.`}],'You are a certified IELTS examiner. Grade accurately.',p=>setOut(p),()=>setBusy(false),userMeta);}
@@ -1249,12 +1307,13 @@ function IELTSTab(){
   </div>;
 }
 
-function EmbassyTab(){
+function EmbassyTab({ userMeta={} }){
   const [country,setCountry]=useState('USA');const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
   const [q,setQ]=useState('');const [ans,setAns]=useState('');const [fb,setFb]=useState('');const [fl,setFl]=useState(false);
   const qs=['Why study in the USA?','Why this university?','How will you fund your education?','Plans after graduation?','Family in the USA?','Why not study in home country?'];
-  async function prep(){setBusy(true);setOut('');await aiStream([{role:'user',content:`${country} student visa interview prep. Give: top 15 questions, ideal answers, documents checklist, dress code, red flags, confidence tips.`}],'You are an expert immigration advisor.',p=>setOut(p),()=>setBusy(false),userMeta);}
-  async function getFb(){if(!ans.trim())return;setFl(true);setFb('');await aiStream([{role:'user',content:`Embassy question:"${q}"\nAnswer:"${ans}"\nEvaluate for ${country}: strengths, red flags, improved answer, score/10.`}],'You are an expert immigration advisor.',p=>setFb(p),()=>setFl(false),userMeta);}
+  // Reduced from 15 questions to 8, removed verbose instructions — 3x faster
+  async function prep(){setBusy(true);setOut('');await aiStream([{role:'user',content:`${country} student visa interview: list 8 key questions with ideal short answers, plus a documents checklist.`}],'You are a visa interview coach. Be concise and practical.',p=>setOut(p),()=>setBusy(false),userMeta);}
+  async function getFb(){if(!ans.trim())return;setFl(true);setFb('');await aiStream([{role:'user',content:`Question:"${q}" Answer:"${ans}" — Score /10, strengths, 1 improvement, better answer.`}],'You are a visa interview coach.',p=>setFb(p),()=>setFl(false),userMeta);}
   return <div style={{display:'grid', gap:16}} className="rg-2">
     <div className="card">
       <FF label="Embassy"><select className="ag-input" value={country} onChange={e=>setCountry(e.target.value)}><option>USA</option><option>UK</option><option>Canada</option><option>Australia</option><option>Germany</option></select></FF>
@@ -1271,9 +1330,9 @@ function EmbassyTab(){
   </div>;
 }
 
-function ScholarTab({profile}){
+function ScholarTab({ profile, userMeta={} }){
   const [field,setField]=useState(profile.major||'');const [level,setLevel]=useState('Undergraduate');const [out,setOut]=useState('');const [busy,setBusy]=useState(false);
-  async function find(){setBusy(true);setOut('');await aiStream([{role:'user',content:`Scholarships for: Field:${field}, Level:${level}, International student.\nTop 10 with names, amounts, deadlines, where to apply. Plus tips for winning applications.`}],'You are an expert scholarship advisor.',p=>setOut(p),()=>setBusy(false),userMeta);}
+  async function find(){setBusy(true);setOut('');await aiStream([{role:'user',content:`Top 8 scholarships for ${level} ${field||'international'} student. Name, amount, deadline, apply link.`}],'You are a scholarship advisor. Be specific and concise.',p=>setOut(p),()=>setBusy(false),userMeta);}
   return <div style={{display:'grid', gap:16}} className="rg-2">
     <div className="card">
       <FF label="Field of Study"><input className="ag-input" value={field} onChange={e=>setField(e.target.value)} placeholder="Computer Science, Business..."/></FF>
